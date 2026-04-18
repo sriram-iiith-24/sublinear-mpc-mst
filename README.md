@@ -17,20 +17,3 @@ python main.py --n 100 --m 300 --alpha 0.5
 python main.py --benchmark
 python main.py --alpha-sweep
 ```
-
-## Theory
-
-Per-machine load at level `i`:
-```
-E[load_i] = f * (4/S)^(i-2)
-```
-
-Peak: `4n/S` at level 3, phase 1. With Chernoff 2× safety:
-```
-max_indegree = 8n/S messages
-recv_limit = 40n/S words
-```
-
-Sublinearity holds for all `α ∈ (0, 1)`:
-- `α ≥ 1/2`: Strictly `O(S)` per machine
-- `α < 1/2`: `O(n^(1-α))` per machine (still sublinear in n)
