@@ -44,7 +44,7 @@ def create_upper_level_machines(config: MPCConfig, machines: dict):
                 memory_limit=config.upper_storage_limit,
                 send_limit=config.upper_send_limit,
                 recv_limit=config.upper_recv_limit,
-                hard_memory=False,
+                hard_memory=True,
             )
     log.info(
         f"[SETUP] Created upper-level machines | levels 2..{config.num_levels}, "
@@ -226,23 +226,147 @@ def _deliver_subround(machines: dict, coordinator, batch: dict,
 
 
 
+def _compute_top_machine_contributions(machines, tree, config, fragments, merge_decisions):
+    num_levels = config.num_levels
+    top_owned = defaultdict(list)
+    for frag in fragments:
+        top_idx = tree.get_top_machine(frag)
+        top_owned[top_idx].append(frag)
+    contributions = {}
+    for mid in machines:
+        if mid[0] != num_levels:
+            continue
+        owned = top_owned.get(mid[1], [])
+        count = sum(1 for fid in owned if fid not in merge_decisions)
+        contributions[mid[1]] = count
+    return contributions
+
+
+def _termination_upward_reduction(machines, num_levels, M, k, coordinator, config):
+    WTERM = config.WORDS_PER_TERM_MSG
+    if M <= 1:
+        return
+    step = 1
+    while step < M:
+        for j in range(0, M, k * step):
+            for i in range(1, k):
+                sender_j = j + i * step
+                if sender_j >= M:
+                    break
+                sender_mid = (num_levels, sender_j)
+                receiver_mid = (num_levels, j)
+                if sender_mid not in machines or receiver_mid not in machines:
+                    continue
+                val = machines[sender_mid].get_local_data('term_partial') or 0
+                machines[sender_mid].send(
+                    receiver_mid, {'partial_sum': val}, word_count=WTERM
+                )
+        coordinator.execute_round(label=f"term_up_step{step}")
+        for j in range(0, M, k * step):
+            mid = (num_levels, j)
+            if mid not in machines:
+                continue
+            machine = machines[mid]
+            current = machine.get_local_data('term_partial') or 0
+            for msg_item in machine.get_inbox():
+                current += msg_item['payload']['partial_sum']
+            machine.store_local_data('term_partial', current, word_count=WTERM)
+        step *= k
+
+
+def _termination_downward_broadcast(machines, num_levels, M, k, coordinator, config):
+    WTERM = config.WORDS_PER_TERM_MSG
+    if M <= 1:
+        return
+    steps = []
+    s = 1
+    while s < M:
+        steps.append(s)
+        s *= k
+    for step in reversed(steps):
+        for j in range(0, M, k * step):
+            sender_mid = (num_levels, j)
+            if sender_mid not in machines:
+                continue
+            val = machines[sender_mid].get_local_data('term_f_new') or 0
+            for i in range(1, k):
+                receiver_j = j + i * step
+                if receiver_j >= M:
+                    break
+                receiver_mid = (num_levels, receiver_j)
+                if receiver_mid in machines:
+                    machines[sender_mid].send(
+                        receiver_mid, {'f_new': val}, word_count=WTERM
+                    )
+        coordinator.execute_round(label=f"term_down_step{step}")
+        for j in range(0, M, k * step):
+            for i in range(1, k):
+                receiver_j = j + i * step
+                if receiver_j >= M:
+                    break
+                mid = (num_levels, receiver_j)
+                if mid not in machines:
+                    continue
+                machine = machines[mid]
+                inbox = machine.get_inbox()
+                if inbox:
+                    val = inbox[0]['payload']['f_new']
+                    machine.store_local_data('term_f_new', val, word_count=WTERM)
+
+
+def run_distributed_termination(machines, tree, coordinator, config,
+                                fragments, merge_decisions) -> int:
+    num_levels = config.num_levels
+    M = config.machines_per_level
+    k = max(2, config.S // 4)
+    WTERM = config.WORDS_PER_TERM_MSG
+
+    contributions = _compute_top_machine_contributions(
+        machines, tree, config, fragments, merge_decisions
+    )
+
+    for mid, machine in machines.items():
+        if mid[0] != num_levels:
+            continue
+        ps = contributions.get(mid[1], 0)
+        machine.store_local_data('term_partial', ps, word_count=WTERM)
+
+    _termination_upward_reduction(machines, num_levels, M, k, coordinator, config)
+
+    root_mid = (num_levels, 0)
+    f_new = 0
+    if root_mid in machines:
+        f_new = machines[root_mid].get_local_data('term_partial') or 0
+        machines[root_mid].store_local_data('term_f_new', f_new, word_count=WTERM)
+
+    _termination_downward_broadcast(machines, num_levels, M, k, coordinator, config)
+
+    log.info(
+        f"[TERMINATION] S/4-ary reduction | M={M} k={k} "
+        f"f_new={f_new} fragments_before={len(fragments)}"
+    )
+    return f_new
+
+
 def run_phase(machines: dict, tree: AggregationTree, coordinator,
               config: MPCConfig, seed: int) -> bool:
     """Execute one complete Boruvka phase.
 
     Steps:
     1. Level-1: classify edges, find local min outgoing per fragment (0 rounds)
-    2. Upward pass with sub-rounds: aggregate min edges through tree
+    2. Upward pass: aggregate min edges through tree (L-1 rounds)
     3. Top-level decision: red/blue coloring determines merges (0 rounds)
-    4. Downward pass with sub-rounds: broadcast decisions through tree
+    4. Downward pass through tree: each machine forwards only to children
+       that contributed in the upward pass (L-1 rounds)
     5. Level-1: apply decisions -- update FIDs, mark MST edges (0 rounds)
-    6. Termination check: OR-aggregation of had_merge (L-1 rounds)
+    6. Termination: S/4-ary fragment-count reduction at top level
 
-    Sub-rounds ensure no machine receives more than recv_limit words per
-    round. Aggregation (min) is associative, so incremental aggregation
-    across sub-rounds preserves correctness.
+    The downward pass mirrors the upward path exactly: decisions flow back
+    through the same tree edges used on the way up (get_children at each
+    level). Collected from the batch dict directly to avoid reading stale
+    upward-pass messages left in machine inboxes.
 
-    Returns True if any merge happened, False otherwise.
+    Returns True if more than one fragment remains, False otherwise.
     """
     num_levels = tree.num_levels
     fragments = tree.fragments
@@ -430,7 +554,7 @@ def run_phase(machines: dict, tree: AggregationTree, coordinator,
 
     log.info(f"[PHASE] STEP 3 RESULT | {len(merge_decisions)} merges decided")
 
-    log.info("[PHASE] STEP 4: Downward pass (sub-rounded)")
+    log.info("[PHASE] STEP 4: Top-level -> L1 direct decision delivery (1 round)")
 
     pending_down = []
     for mid, machine in machines.items():
@@ -439,162 +563,55 @@ def run_phase(machines: dict, tree: AggregationTree, coordinator,
         frag_mins = machine.get_local_data('frag_mins')
         if frag_mins is None:
             continue
-
         for fid in frag_mins:
-            children = tree.get_children(mid[1], fid, num_levels)
             if fid in merge_decisions:
-                for child_idx in children:
-                    pending_down.append({
-                        'sender': mid,
-                        'recipient': (num_levels - 1, child_idx),
-                        'payload': merge_decisions[fid],
-                        'word_count': WDOWN,
-                    })
+                payload, wc = merge_decisions[fid], WDOWN
             else:
-                for child_idx in children:
-                    pending_down.append({
-                        'sender': mid,
-                        'recipient': (num_levels - 1, child_idx),
-                        'payload': {'old_fid': fid, 'no_merge': True},
-                        'word_count': WTERM,
-                    })
+                payload, wc = {'old_fid': fid, 'no_merge': True}, WTERM
+            for l1_idx in tree.get_responsible_machines(fid, 1):
+                pending_down.append({
+                    'sender': mid,
+                    'recipient': (1, l1_idx),
+                    'payload': payload,
+                    'word_count': wc,
+                })
 
-    for level in range(num_levels - 1, 1, -1):
-        sub_rounds, total = _flush_and_batch(
-            machines, config.upper_recv_limit, pending_msgs=pending_down
-        )
-        pending_down = []
-
-        if not sub_rounds:
-            log.info(f"[DOWNWARD L{level}] No messages to deliver")
-            continue
-
-        log.info(
-            f"[DOWNWARD L{level+1}->L{level}] {total} msgs in "
-            f"{len(sub_rounds)} sub-round(s)"
-        )
-
-        accumulated = defaultdict(list)
-        for sub_idx, batch in enumerate(sub_rounds):
-            _deliver_subround(
-                machines, coordinator, batch,
-                f"downward_L{level+1}->L{level}", sub_idx, len(sub_rounds),
-            )
-
-            for mid, machine in machines.items():
-                if mid[0] != level:
-                    continue
-                for msg_item in machine.get_inbox():
-                    accumulated[mid].append(msg_item)
-
-        for mid, machine in machines.items():
-            if mid[0] != level:
-                continue
-            for msg_item in accumulated.get(mid, []):
-                p = msg_item['payload']
-                fid = p['old_fid']
-                children = tree.get_children(mid[1], fid, level)
-                for child_idx in children:
-                    pending_down.append({
-                        'sender': mid,
-                        'recipient': (level - 1, child_idx),
-                        'payload': p,
-                        'word_count': msg_item['word_count'],
-                    })
-
-    log.info("[PHASE] STEP 5: Deliver to level-1 and apply decisions")
+    log.info("[PHASE] STEP 5: Deliver decisions to L1 and apply")
 
     had_merge = False
     l1_had_merge = set()
 
-    if num_levels > 1:
-        sub_rounds, total = _flush_and_batch(
-            machines, config.upper_recv_limit, pending_msgs=pending_down
-        )
-
-        if sub_rounds:
-            log.info(
-                f"[DOWNWARD L2->L1] {total} msgs in "
-                f"{len(sub_rounds)} sub-round(s)"
+    sub_rounds, total = _flush_and_batch(
+        machines, config.upper_recv_limit, pending_msgs=pending_down
+    )
+    if sub_rounds:
+        log.info(f"[DOWNWARD top->L1] {total} msgs in {len(sub_rounds)} sub-round(s)")
+        for sub_idx, batch in enumerate(sub_rounds):
+            _deliver_subround(
+                machines, coordinator, batch,
+                "downward_top->L1", sub_idx, len(sub_rounds),
             )
-
-            for sub_idx, batch in enumerate(sub_rounds):
-                _deliver_subround(
-                    machines, coordinator, batch,
-                    "downward_L2->L1", sub_idx, len(sub_rounds),
-                )
-
-                for mid, machine in machines.items():
-                    if mid[0] != 1:
-                        continue
-                    for msg_item in machine.get_inbox():
-                        p = msg_item['payload']
-                        if 'new_fid' in p:
-                            had_merge = True
-                            l1_had_merge.add(mid)
-                            machine.update_fids(p['old_fid'], p['new_fid'])
-                            machine.mark_mst_edge(p['u'], p['v'], p['weight'])
+            for rid, (msgs, _wc) in batch.items():
+                if rid[0] != 1:
+                    continue
+                machine = machines[rid]
+                for msg in msgs:
+                    p = msg['payload']
+                    if 'new_fid' in p:
+                        had_merge = True
+                        l1_had_merge.add(rid)
+                        machine.update_fids(p['old_fid'], p['new_fid'])
+                        machine.mark_mst_edge(p['u'], p['v'], p['weight'])
 
     log.info(
         f"[PHASE] STEP 5 RESULT | had_merge={had_merge} "
         f"L1_machines_with_merge={len(l1_had_merge)}"
     )
 
-    log.info("[PHASE] STEP 6: Termination check (OR-aggregation)")
+    log.info("[PHASE] STEP 6: Distributed fragment-count termination (S/4-ary)")
 
-    l1_machine_frags = defaultdict(list)
-    for frag in fragments:
-        for midx in tree.get_responsible_machines(frag, 1):
-            l1_machine_frags[midx].append(frag)
-
-    for mid, machine in machines.items():
-        if mid[0] != 1:
-            continue
-        local_has_inter = 1 if any(
-            e['fid_u'] != e['fid_v'] for e in machine.get_edges()
-        ) else 0
-
-        responsible_frags = l1_machine_frags.get(mid[1], [])
-        if responsible_frags:
-            frag = min(responsible_frags)
-            parent_idx = tree.get_parent(mid[1], frag, 1)
-            machine.send(
-                (2, parent_idx),
-                {'has_inter': local_has_inter, '_term_frag': frag},
-                word_count=WTERM,
-            )
-
-    for level in range(2, num_levels + 1):
-        coordinator.execute_round(label=f"term_up_L{level-1}->L{level}")
-
-        for mid, machine in machines.items():
-            if mid[0] != level:
-                continue
-            agg_inter = 0
-            for msg_item in machine.get_inbox():
-                if msg_item['payload'].get('has_inter', 0) == 1:
-                    agg_inter = 1
-                    break
-            machine.store_local_data('has_inter', agg_inter, word_count=WTERM)
-
-            if level < num_levels and machine.get_inbox():
-                frag = machine.get_inbox()[0]['payload'].get('_term_frag', min(fragments))
-                parent_idx = tree.get_parent(mid[1], frag, level)
-                machine.send(
-                    (level + 1, parent_idx),
-                    {'has_inter': agg_inter, '_term_frag': frag},
-                    word_count=WTERM,
-                )
-
-    global_has_inter = False
-    for mid, machine in machines.items():
-        if mid[0] == num_levels:
-            if machine.get_local_data('has_inter') == 1:
-                global_has_inter = True
-
-    log.info(
-        f"[PHASE] TERMINATION | global_has_inter={global_has_inter} "
-        f"(distributed OR-aggregation, {num_levels - 1} rounds)"
+    f_new = run_distributed_termination(
+        machines, tree, coordinator, config, fragments, merge_decisions
     )
 
     for mid, machine in machines.items():
@@ -602,11 +619,13 @@ def run_phase(machines: dict, tree: AggregationTree, coordinator,
             machine.clear_local_data()
 
     new_frags = get_current_fragments(machines)
+    continue_phases = f_new > 1
     log.info(
         f"[PHASE] === END | fragments: {len(fragments)} -> {len(new_frags)} "
-        f"| merges={len(merge_decisions)} has_inter={global_has_inter} ==="
+        f"| merges={len(merge_decisions)} f_new={f_new} "
+        f"continue={continue_phases} ==="
     )
-    return global_has_inter
+    return continue_phases
 
 
 
@@ -639,11 +658,11 @@ def run_algorithm(n: int, edges: list, config: MPCConfig) -> tuple:
         tree = AggregationTree(config, fragments, seed, level1_frag_map)
 
         create_upper_level_machines(config, machines)
-        has_inter = run_phase(machines, tree, coordinator, config, seed)
+        continue_phases = run_phase(machines, tree, coordinator, config, seed)
         remove_upper_level_machines(config, machines)
 
-        if not has_inter:
-            log.info("[ALGORITHM] Distributed termination: no inter-fragment edges remain")
+        if not continue_phases:
+            log.info("[ALGORITHM] Distributed termination: only one fragment remains")
             break
     else:
         log.warning(f"[ALGORITHM] Hit max_phases={config.max_phases} without converging!")

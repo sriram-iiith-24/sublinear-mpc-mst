@@ -178,7 +178,7 @@ class Machine:
             if self.hard_memory:
                 raise MemoryViolation(msg)
             else:
-                log.debug(f"[MACHINE {self.id}] MEM_EXCEED | {msg}")
+                log.warning(f"[MACHINE {self.id}] MEM_VIOLATION | {msg}")
         if key in self._local_data:
             self._local_data_words -= self._local_data[key][1]
         self._local_data[key] = (data, word_count)
@@ -203,9 +203,9 @@ class Machine:
         self.peak_send = max(self.peak_send, new_sent)
         if new_sent > self.send_limit:
             self.violations['send'].append((new_sent, self.send_limit))
-            log.debug(
-                f"[MACHINE {self.id}] SEND_EXCEED | {new_sent} words "
-                f"(limit {self.send_limit})"
+            log.warning(
+                f"[MACHINE {self.id}] SEND_VIOLATION | {new_sent} words "
+                f"(limit {self.send_limit}) | over by {new_sent - self.send_limit}"
             )
         self._outbox.append({
             'sender': self.id,
@@ -229,9 +229,9 @@ class Machine:
         self.peak_recv = max(self.peak_recv, total_words)
         if total_words > self.recv_limit:
             self.violations['recv'].append((total_words, self.recv_limit))
-            log.debug(
-                f"[MACHINE {self.id}] RECV_EXCEED | {total_words} words "
-                f"(limit {self.recv_limit})"
+            log.warning(
+                f"[MACHINE {self.id}] RECV_VIOLATION | {total_words} words "
+                f"(limit {self.recv_limit}) | over by {total_words - self.recv_limit}"
             )
         self._inbox = messages
         self._inbox_words = total_words

@@ -3,8 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-.memsearch/
 *.pdf
 !reference_docs/*.pdf
-coordinator.txt
+!sriram-metla_IS_final_report.pdf
 docs/

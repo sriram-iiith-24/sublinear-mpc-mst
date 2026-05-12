@@ -29,18 +29,21 @@ class MPCConfig:
             self.num_levels = 1
         else:
             raw_levels = math.ceil(math.log(m, base)) if m > 1 else 1
-            max_levels = math.ceil(4 / alpha)
-            self.num_levels = max(1, min(raw_levels, max_levels))
-
-        self.max_indegree = 2 * n
+            self.num_levels = max(1, raw_levels)
 
         self.threshold_level = math.ceil(1.0 / alpha + 1)
 
         self.level1_send_limit = 2 * self.edges_per_machine * self.WORDS_PER_UP_MSG
 
-        self.upper_recv_limit = self.max_indegree * self.WORDS_PER_UP_MSG
-        self.upper_send_limit = self.max_indegree * self.WORDS_PER_UP_MSG
-        self.upper_storage_limit = self.max_indegree * self.WORDS_PER_UP_MSG
+        self.UPPER_RECV_CONST = 10
+        self.UPPER_SEND_CONST = 20
+        self.UPPER_STORAGE_CONST = 20
+
+        self.upper_recv_limit = self.UPPER_RECV_CONST * self.S
+        self.upper_send_limit = self.UPPER_SEND_CONST * self.S
+        self.upper_storage_limit = self.UPPER_STORAGE_CONST * self.S
+
+        self.max_indegree = self.upper_recv_limit // self.WORDS_PER_UP_MSG
 
         self.max_phases = math.ceil(10 * math.log2(n))
 
